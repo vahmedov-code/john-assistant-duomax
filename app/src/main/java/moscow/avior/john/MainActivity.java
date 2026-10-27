@@ -22,6 +22,18 @@ public class MainActivity extends Activity implements RecognitionListener {
     private SpeechRecognizer recognizer;
     private String pending;
     private volatile boolean recording;
+    private TextView voiceStatus, modelStatus;
+    private ProgressBar modelProgress;
+    private Button downloadModel, cancelDownload, startJohn, stopJohn;
+    private ModelStore modelStore;
+    private boolean resumed;
+    private final Runnable refreshVoice = new Runnable() {
+        @Override public void run() {
+            if (!resumed) return;
+            renderVoice();
+            handler.postDelayed(this, 500);
+        }
+    };
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final MediaController.Callback callback = new MediaController.Callback() {
         @Override public void onPlaybackStateChanged(PlaybackState state) { show("Обновление плеера: " + stateText(state)); }
@@ -38,7 +50,24 @@ public class MainActivity extends Activity implements RecognitionListener {
         layout.setBackgroundColor(Color.rgb(18,23,34));
         scroll.addView(layout);
         TextView title = new TextView(this);
-        title.setText("JOHN ASSISTANT  0.2-test"); title.setTextSize(24); title.setTextColor(Color.WHITE); layout.addView(title);
+        title.setText("JOHN ASSISTANT  0.3"); title.setTextSize(24); title.setTextColor(Color.WHITE); layout.addView(title);
+        modelStore = ModelStore.get(this);
+        voiceStatus = new TextView(this);
+        voiceStatus.setTextColor(Color.rgb(185,231,255)); voiceStatus.setTextSize(18);
+        voiceStatus.setPadding(0,dp(12),0,dp(12)); voiceStatus.setTextIsSelectable(true); layout.addView(voiceStatus);
+        modelStatus = new TextView(this); modelStatus.setTextColor(Color.WHITE); modelStatus.setTextSize(17); layout.addView(modelStatus);
+        modelProgress = new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);
+        modelProgress.setMax(100); layout.addView(modelProgress,new LinearLayout.LayoutParams(-1,dp(16)));
+        downloadModel = add(layout,"Скачать модель",()->{
+            if(recording || recognizer!=null || VoiceState.active) {show("Сначала остановите микрофон."); return;}
+            modelStore.download(); renderVoice();
+        });
+        cancelDownload = add(layout,"Отменить загрузку",()->modelStore.cancel());
+        startJohn = add(layout,"Запустить Джона",()->permission("vosk"));
+        stopJohn = add(layout,"Остановить Джона",()->{
+            getSharedPreferences("john",MODE_PRIVATE).edit().putBoolean("voiceRequested",false).apply();
+            stopService(new Intent(this,VoiceService.class));
+        });
         status = new TextView(this); status.setTextSize(17); status.setTextColor(Color.rgb(160,217,255));
         status.setPadding(0,dp(16),0,dp(16)); status.setTextIsSelectable(true); layout.addView(status);
         add(layout,"1. Доступ к уведомлениям",()->openSettings());
@@ -53,14 +82,38 @@ public class MainActivity extends Activity implements RecognitionListener {
         add(layout,"Проверить микрофон: 3 секунды",()->permission("mic"));
         add(layout,"Голосовая команда по нажатию",()->permission("speech"));
         TextView foot = new TextView(this); foot.setTextColor(Color.LTGRAY); foot.setTextSize(15);
-        foot.setText("Команды: пауза, играй, дальше, назад, громче, тише.\nМикрофон включается только кнопкой. Проверка уровня не сохраняет и не передаёт звук. Системное распознавание может использовать сеть.\nАвтостарт восстанавливает доступ к медиасессиям. Постоянное прослушивание слова «Джон» не реализовано.");
+        foot.setText("Локально: «Джон, громче», «Джон, тише», «Джон, выключи звук», «Джон, следующий трек», «Джон, пауза». Можно сказать «Джон», затем команду в течение 5 секунд.\nИнтернет нужен только для скачивания модели. Звук и распознанные фразы не сохраняются и не передаются. Системная голосовая кнопка может использовать сеть.\nМикрофон работает в службе с уведомлением после нажатия «Запустить Джона». После перезагрузки или остановки системой запустите его кнопкой заново. Работа при выключенном экране и рядом с Алисой требует проверки на YaOS.");
         layout.addView(foot); setContentView(scroll); checkSession();
     }
     private int dp(int n){ return (int)(n*getResources().getDisplayMetrics().density+.5f); }
-    private void add(LinearLayout p,String text,Runnable run){
+    private Button add(LinearLayout p,String text,Runnable run){
         Button b=new Button(this); b.setText(text); b.setAllCaps(false); b.setMinHeight(dp(48));
         LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2); lp.bottomMargin=dp(8); p.addView(b,lp);
         b.setOnClickListener(v->{try{run.run();}catch(Exception e){show("Ошибка: "+e.getClass().getSimpleName()+": "+e.getMessage());}});
+        return b;
+    }
+    private void renderVoice(){
+        modelStatus.setText(modelStore.status+(modelStore.error.isEmpty()?"":"\n"+modelStore.error));
+        modelProgress.setVisibility(modelStore.busy?android.view.View.VISIBLE:android.view.View.GONE);
+        modelProgress.setIndeterminate(modelStore.progress<0); if(modelStore.progress>=0)modelProgress.setProgress(modelStore.progress);
+        downloadModel.setText(modelStore.isReady()?"Скачать модель заново":"Скачать модель · около 45 МБ");
+        downloadModel.setEnabled(!modelStore.busy&&!VoiceState.active&&!recording&&recognizer==null);
+        cancelDownload.setVisibility(modelStore.busy?android.view.View.VISIBLE:android.view.View.GONE);
+        startJohn.setEnabled(modelStore.isReady()&&!modelStore.busy&&!VoiceState.active&&!recording&&recognizer==null);
+        stopJohn.setEnabled(VoiceState.active);
+        String recovery = !VoiceState.active&&getSharedPreferences("john",MODE_PRIVATE).getBoolean("voiceRequested",false)
+                ? "\nРанее Джон был включён. После загрузки/остановки системы нажмите запуск заново." : "";
+        voiceStatus.setText("Микрофон: "+(VoiceState.microphone?"ВКЛ · уровень "+VoiceState.peak:VoiceState.active?"подготовка":"выключен")+
+                "\n"+VoiceState.status+"\nПоследняя фраза: "+VoiceState.phrase+
+                "\nПоследняя команда: "+VoiceState.command+(VoiceState.error.isEmpty()?"":"\nОшибка: "+VoiceState.error)+recovery);
+    }
+    private void startVosk(){
+        if(!resumed){show("Для запуска микрофона вернитесь в приложение.");return;}
+        if(!modelStore.isReady()||modelStore.busy){show("Сначала скачайте модель.");return;}
+        if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},8);
+        try {startForegroundService(new Intent(this,VoiceService.class).setAction(VoiceService.START));}
+        catch(Exception e){VoiceState.error="Система запретила запуск: "+e.getMessage();show(VoiceState.error);}
     }
     private void show(String text){status.setText(text);}
     private void openSettings(){
@@ -95,9 +148,10 @@ public class MainActivity extends Activity implements RecognitionListener {
     }
     private void volume(int direction){audio.adjustStreamVolume(3,direction,AudioManager.FLAG_SHOW_UI);show("Громкость: "+audio.getStreamVolume(3)+"/"+audio.getStreamMaxVolume(3)+"; без звука: "+audio.isStreamMute(3));}
     private void permission(String action){
+        if(VoiceState.active){show("Сначала нажмите «Остановить Джона», чтобы освободить микрофон.");return;}
         if(recording || recognizer!=null){show("Проверка уже идёт.");return;}
         if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){pending=action;requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},7);return;}
-        if("mic".equals(action))testMic();else speech();
+        if("mic".equals(action))testMic();else if("vosk".equals(action))startVosk();else speech();
     }
     @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] result){super.onRequestPermissionsResult(request,permissions,result);if(request==7){String a=pending;pending=null;if(result.length>0&&result[0]==PackageManager.PERMISSION_GRANTED)permission(a);else show("Микрофон не разрешён. Управление кнопками доступно.");}}
     private void testMic(){
@@ -105,6 +159,8 @@ public class MainActivity extends Activity implements RecognitionListener {
         new Thread(()->{
             AudioRecord rec=null;String result;
             try {
+                if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED)
+                    throw new SecurityException("Доступ к микрофону отозван");
                 int min=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
                 if(min<=0)throw new IllegalStateException("PCM 16 kHz не поддерживается: "+min);
                 rec=new AudioRecord(MediaRecorder.AudioSource.MIC,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,Math.max(min,4096));
@@ -128,6 +184,8 @@ public class MainActivity extends Activity implements RecognitionListener {
     @Override public void onResults(Bundle b){ArrayList<String> r=b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);stopSpeech();if(r==null||r.isEmpty()){show("Речь не распознана.");return;}String s=r.get(0).toLowerCase(new Locale("ru","RU"));try{String c=CommandParser.parse(s);if("louder".equals(c))volume(1);else if("quieter".equals(c))volume(-1);else if(c!=null)transport(c);else show("Неизвестная команда: "+s);}catch(Exception e){show("Команда: "+e.getMessage());}}
     @Override public void onError(int error){stopSpeech();show("Распознавание: код ошибки "+error+". Проверьте службу речи, сеть и доступ к микрофону.");}
     @Override protected void onPause(){recording=false;stopSpeech();super.onPause();}
+    @Override protected void onResume(){super.onResume();resumed=true;handler.removeCallbacks(refreshVoice);refreshVoice.run();}
+    @Override protected void onStop(){resumed=false;handler.removeCallbacks(refreshVoice);super.onStop();}
     @Override protected void onDestroy(){recording=false;stopSpeech();if(observed!=null)observed.unregisterCallback(callback);super.onDestroy();}
     @Override public void onReadyForSpeech(Bundle b){} @Override public void onBeginningOfSpeech(){} @Override public void onRmsChanged(float r){} @Override public void onBufferReceived(byte[] b){} @Override public void onEndOfSpeech(){} @Override public void onPartialResults(Bundle b){} @Override public void onEvent(int e,Bundle b){}
 }

@@ -13,12 +13,17 @@ android {
         applicationId 'moscow.avior.john'
         minSdk 26
         targetSdk 32
-        versionCode 2
-        versionName '0.2-test'
+        versionCode 3
+        versionName '0.3'
+        testInstrumentationRunner 'moscow.avior.john.VoiceSmokeInstrumentation'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
+    }
+    lint {
+        // Sideloaded YaOS app: preserve the station-tested target 32, not a Google Play submission.
+        disable 'ExpiredTargetSdkVersion'
     }
     if (signingFile.exists()) {
         signingConfigs {
@@ -33,4 +38,10 @@ android {
             debug { signingConfig signingConfigs.localTest }
         }
     }
+}
+
+dependencies {
+    implementation 'com.alphacephei:vosk-android:0.3.75@aar'
+    implementation 'net.java.dev.jna:jna:5.18.1@aar'
+    testImplementation 'junit:junit:4.13.2'
 }
